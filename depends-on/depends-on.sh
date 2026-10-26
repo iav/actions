@@ -292,10 +292,26 @@ function evaluate_pull_request() {
 		'{number: $number, sha: $sha, state: $state, description: $description, comment: $comment}'
 }
 
+# Is $1 the comment met_comment writes: the heading, "- " items, the marker?
+function is_met_comment() {
+	[[ ${#1} -le 4000 ]] || return 1
+	declare -a lines
+	mapfile -t lines <<< "${1}"
+	declare last=$((${#lines[@]} - 1)) i
+	[[ "${lines[0]}" == "All dependencies are met:" ]] || return 1
+	[[ "${lines[last]}" =~ ^\<!--\ depends-on:\ met\ [0-9a-f]{12}\ --\>$ ]] || return 1
+	for ((i = 1; i < last; i++)); do
+		[[ -z "${lines[i]}" || "${lines[i]}" == "- "* ]] || return 1
+	done
+}
+
 # Set the statuses and post the comments of a JSON array of decisions. Needs
-# write access, reads no pull request body: every field is checked for shape.
+# write access, reads no pull request body. The decisions come from the
+# evaluate step and are trusted as far as that step is: a forged one can at
+# most hit the head commit of an open pull request it names, with a comment
+# of the fixed shape.
 function apply_decisions() {
-	declare item number sha state description comment
+	declare item number sha state description comment head
 	while IFS= read -r item; do
 		number="$(jq -r '.number' <<< "${item}")"
 		sha="$(jq -r '.sha' <<< "${item}")"
@@ -305,6 +321,15 @@ function apply_decisions() {
 		if [[ ! "${number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ || ! "${state}" =~ ^(success|pending|failure)$ ]]; then
 			echo "Skipping a malformed decision: ${item:0:200}" >&2
 			continue
+		fi
+		head="$(gh api "repos/${repo}/pulls/${number}" --jq 'select(.state == "open") | .head.sha' 2> /dev/null || true)"
+		if [[ "${head}" != "${sha}" ]]; then
+			echo "Skipping #${number}: ${sha:0:12} is not the head of an open pull request (now ${head:-none})" >&2
+			continue
+		fi
+		if [[ -n "${comment}" ]] && ! is_met_comment "${comment}"; then
+			echo "Dropping an unexpected comment for #${number}" >&2
+			comment=""
 		fi
 		gh api -X POST "repos/${repo}/statuses/${sha}" -f state="${state}" -f context="${context}" \
 			-f description="${description:0:140}" -f target_url="${run_url}" > /dev/null
