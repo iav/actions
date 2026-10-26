@@ -224,10 +224,11 @@ function override_actor() {
 		jq -rs --arg l "${override_label}" '[.[][] | select(.event == "labeled" and .label.name == $l)] | last | .actor.login // empty'
 }
 
-# Comment on pull request $1 that all of its dependencies are met, once per
-# set of dependencies: the hidden marker carries a hash of the set.
+# Print the comment that announces to pull request $1 that all of its
+# dependencies are met, or nothing if it was already posted for this set of
+# dependencies: the hidden marker carries a hash of the set.
 # <number> <reason>...
-function announce_met() {
+function met_comment() {
 	declare number="${1}" && shift
 	declare hash marker one
 	hash="$(printf '%s\n' "${deps[@]}" | sort | sha1sum | cut -c1-12)"
@@ -235,23 +236,16 @@ function announce_met() {
 	if gh api --paginate "repos/${repo}/issues/${number}/comments?per_page=100" --jq '.[].body' 2> /dev/null | grep -qF "${marker}"; then
 		return 0
 	fi
-	{
-		echo "All dependencies are met:"
-		for one in "$@"; do
-			echo "- ${one}"
-		done
-		echo
-		echo "${marker}"
-	} | gh api -X POST "repos/${repo}/issues/${number}/comments" -F body=@- > /dev/null
+	echo "All dependencies are met:"
+	for one in "$@"; do
+		echo "- ${one}"
+	done
+	echo
+	echo "${marker}"
 }
 
-function set_status() {
-	declare sha="${1}" state="${2}" description="${3}"
-	gh api -X POST "repos/${repo}/statuses/${sha}" -f state="${state}" -f context="${context}" \
-		-f description="${description:0:140}" -f target_url="${run_url}" > /dev/null
-}
-
-function check_pull_request() {
+# Print one JSON object with the decision for pull request $1. Needs read access only.
+function evaluate_pull_request() {
 	declare number="${1}" pr sha body labels
 	pr="$(gh api "repos/${repo}/pulls/${number}")"
 	sha="$(jq -r '.head.sha' <<< "${pr}")"
@@ -261,7 +255,7 @@ function check_pull_request() {
 	declare -a deps
 	mapfile -t deps < <(parse_dependencies <<< "${body}")
 
-	declare state=success description="no dependencies" one
+	declare state=success description="no dependencies" comment="" one
 	declare -a waiting=() broken=() met=()
 	for one in "${deps[@]}"; do
 		check_dependency "${one}"
@@ -277,7 +271,7 @@ function check_pull_request() {
 		state=pending description="waiting: $(IFS=';' && echo "${waiting[*]}")"
 	elif [[ ${#met[@]} -gt 0 ]]; then
 		description="met: $(IFS=';' && echo "${met[*]}")"
-		announce_met "${number}" "${met[@]}"
+		comment="$(met_comment "${number}" "${met[@]}")"
 	fi
 
 	if [[ "${state}" != "success" ]] && grep -qxF "${override_label}" <<< "${labels}"; then
@@ -291,11 +285,34 @@ function check_pull_request() {
 		fi
 	fi
 
-	set_status "${sha}" "${state}" "${description}"
-	echo "#${number} ${sha:0:12} ${state}: ${description}"
-	{
-		echo "| #${number} | ${state} | ${description//|/\\|} |"
-	} >> "${summary}"
+	echo "#${number} ${sha:0:12} ${state}: ${description}" >&2
+	echo "| #${number} | ${state} | ${description//|/\\|} |" >> "${summary}"
+	jq -nc --argjson number "${number}" --arg sha "${sha}" --arg state "${state}" \
+		--arg description "${description:0:140}" --arg comment "${comment}" \
+		'{number: $number, sha: $sha, state: $state, description: $description, comment: $comment}'
+}
+
+# Set the statuses and post the comments of a JSON array of decisions. Needs
+# write access, reads no pull request body: every field is checked for shape.
+function apply_decisions() {
+	declare item number sha state description comment
+	while IFS= read -r item; do
+		number="$(jq -r '.number' <<< "${item}")"
+		sha="$(jq -r '.sha' <<< "${item}")"
+		state="$(jq -r '.state' <<< "${item}")"
+		description="$(jq -r '.description' <<< "${item}")"
+		comment="$(jq -r '.comment' <<< "${item}")"
+		if [[ ! "${number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ || ! "${state}" =~ ^(success|pending|failure)$ ]]; then
+			echo "Skipping a malformed decision: ${item:0:200}" >&2
+			continue
+		fi
+		gh api -X POST "repos/${repo}/statuses/${sha}" -f state="${state}" -f context="${context}" \
+			-f description="${description:0:140}" -f target_url="${run_url}" > /dev/null
+		if [[ -n "${comment}" ]]; then
+			gh api -X POST "repos/${repo}/issues/${number}/comments" -f body="${comment}" > /dev/null
+		fi
+		echo "#${number} ${sha:0:12} ${state}"
+	done < <(jq -c '.[]' <<< "${1}")
 }
 
 function pull_requests_to_check() {
@@ -316,15 +333,40 @@ function pull_requests_to_check() {
 	gh api --paginate "repos/${repo}/pulls?state=open&per_page=100" --jq '.[].number'
 }
 
-function main() {
+# Print the decisions for the pull requests to check as a JSON array.
+function evaluate() {
 	{
 		echo "| Pull request | State | Details |"
 		echo "|---|---|---|"
 	} >> "${summary}"
 	declare one_pr
 	while read -r one_pr; do
-		check_pull_request "${one_pr}"
-	done < <(pull_requests_to_check)
+		evaluate_pull_request "${one_pr}"
+	done < <(pull_requests_to_check) | jq -sc '.'
+}
+
+# evaluate: read-only, writes the decisions to the step output 'result'.
+# apply: sets statuses and comments from DEPENDS_ON_RESULT.
+# all: both in one step, with one token.
+function main() {
+	declare result
+	case "${DEPENDS_ON_MODE:-all}" in
+		evaluate)
+			result="$(evaluate)"
+			echo "result=${result}" >> "${GITHUB_OUTPUT:-/dev/null}"
+			;;
+		apply)
+			apply_decisions "${DEPENDS_ON_RESULT:?}"
+			;;
+		all)
+			result="$(evaluate)"
+			apply_decisions "${result}"
+			;;
+		*)
+			echo "Unknown mode '${DEPENDS_ON_MODE}'" >&2
+			return 1
+			;;
+	esac
 }
 
 # Sourcing defines the functions only, for tests.

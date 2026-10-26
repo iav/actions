@@ -2,12 +2,20 @@ name: "Pull request dependencies"
 author: "Igor Velkov"
 description: "Hold a pull request until the pull requests or git refs named on its Depends-on: lines are merged"
 inputs:
+  mode:
+    description: "evaluate: read-only, outputs the decisions; apply: sets statuses and comments from 'result'; all: both in one step"
+    required: false
+    default: "all"
+  result:
+    description: "Decisions from an evaluate step, for mode apply"
+    required: false
+    default: ""
   pull-requests:
     description: "Pull request numbers to check, or 'all'; empty: the event's pull request, or all open ones"
     required: false
     default: ""
   token:
-    description: "Token that sets commit statuses and comments; it must also read the repositories named in Depends-on: lines"
+    description: "evaluate: reads pull requests and the repositories named in Depends-on: lines; apply: sets statuses and comments"
     required: false
     default: ${{ github.token }}
   context:
@@ -22,13 +30,20 @@ inputs:
     description: "Lowest repository role whose override label counts: admin, maintain, write"
     required: false
     default: "maintain"
+outputs:
+  result:
+    description: "Decisions of mode evaluate, for mode apply"
+    value: ${{ steps.depends-on.outputs.result }}
 runs:
   using: "composite"
   steps:
     - name: "Check Depends-on: lines"
+      id: depends-on
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
+        DEPENDS_ON_MODE: ${{ inputs.mode }}
+        DEPENDS_ON_RESULT: ${{ inputs.result }}
         DEPENDS_ON_REPOSITORY: ${{ github.repository }}
         DEPENDS_ON_PULL_REQUESTS: ${{ inputs.pull-requests }}
         DEPENDS_ON_CONTEXT: ${{ inputs.context }}
