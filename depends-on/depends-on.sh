@@ -39,6 +39,7 @@ notify_ttl_days="${DEPENDS_ON_NOTIFY_TTL_DAYS:-365}"
 git_every_hours="${DEPENDS_ON_GIT_EVERY_HOURS:-6}"
 git_max_fetches="${DEPENDS_ON_GIT_MAX_FETCHES:-10}"
 git_fetch_timeout="${DEPENDS_ON_GIT_FETCH_TIMEOUT:-300}"
+max_lines="${DEPENDS_ON_MAX_LINES:-20}"
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
@@ -179,7 +180,7 @@ function check_github_pull_request() {
 function git_resolve() {
 	declare listed
 	git_sha=""
-	listed="$(safe_git ls-remote "${1}" "${2}" "${2}^{}" 2> /dev/null)" || return 1
+	listed="$(timeout --kill-after=5 60 git "${safe_git_options[@]}" ls-remote "${1}" "${2}" "${2}^{}" 2> /dev/null)" || return 1
 	# A peeled tag names the commit; prefer it over the tag object.
 	git_sha="$(awk '$2 ~ /\^\{\}$/ { print $1; exit } !first { first = $1 } END { if (first) print first }' <<< "${listed}" | head -n1)"
 }
@@ -196,7 +197,7 @@ function git_fetch_once() {
 	git_fetches=$((git_fetches + 1))
 	declare start=${SECONDS} rc=0
 	timeout --kill-after=10 "${git_fetch_timeout}" git "${safe_git_options[@]}" -C "${git_dir}" fetch -q --filter=tree:0 "$@" 2> /dev/null || rc=$?
-	echo "| ${url} | ${what} | $((SECONDS - start)) s | $( ((rc == 0)) && echo ok || echo "failed (${rc})") |" >> "${work_dir}/fetches"
+	echo "| ${url} | ${what} | $((SECONDS - start)) s | $( ((rc == 0)) && echo ok || echo "failed (${rc})") |" | tee -a "${work_dir}/fetches" >&2
 	if ((rc == 124 || rc == 137)); then
 		return 3
 	fi
@@ -236,12 +237,13 @@ function git_fetch() {
 	return "${rc}"
 }
 
-# Set dep_state and dep_reason for a git_fetch return code other than 0.
+# Set dep_state and dep_reason for a git_fetch return code other than 0. A
+# fetch cut by a limit holds the pull request: skip would keep an old success.
 function fetch_failed() {
 	case "${1}" in
 		1) dep_state=bad dep_reason="${2}: cannot fetch ${3}" ;;
-		2) dep_state=skip dep_reason="${2}: ${3} over the fetch limit of this run" ;;
-		*) dep_state=skip dep_reason="${2}: ${3} fetch over ${git_fetch_timeout} s" ;;
+		2) dep_state=wait dep_reason="${2}: ${3} over the fetch limit of this run" ;;
+		*) dep_state=wait dep_reason="${2}: ${3} fetch over ${git_fetch_timeout} s" ;;
 	esac
 }
 
@@ -394,13 +396,20 @@ function evaluate_pull_request() {
 	declare -a deps notifies new_comments=()
 	mapfile -t deps < <(parse_lines "depends-on" <<< "${body}")
 	mapfile -t notifies < <(parse_lines "notify-when" <<< "${body}")
+	# Merged pull requests are watched too: cap their lines as well.
+	[[ "${pr_state}" == "open" ]] || notifies=("${notifies[@]:0:max_lines}")
 
 	# Depends-on: a status on open pull requests only.
 	declare state="" description="" one
 	if [[ "${pr_state}" == "open" ]]; then
 		declare -a waiting=() broken=() met=() skipped=()
+		if ((${#deps[@]} + ${#notifies[@]} > max_lines)); then
+			broken+=("more than ${max_lines} Depends-on and Notify-when lines")
+			deps=() notifies=()
+		fi
 		for one in "${deps[@]}"; do
 			check_condition "${one}"
+			echo "#${number} Depends-on: ${dep_state}: ${dep_reason}" >&2
 			case "${dep_state}" in
 				ok) met+=("${dep_reason}") ;;
 				wait) waiting+=("${dep_reason}") ;;
@@ -411,10 +420,12 @@ function evaluate_pull_request() {
 		state=success description="no dependencies"
 		if [[ ${#broken[@]} -gt 0 ]]; then
 			state=failure description="$(IFS=';' && echo "${broken[*]}")"
-		elif [[ ${#skipped[@]} -gt 0 ]]; then
-			state="" description="not due: $(IFS=';' && echo "${skipped[*]}")"
 		elif [[ ${#waiting[@]} -gt 0 ]]; then
 			state=pending description="waiting: $(IFS=';' && echo "${waiting[*]}")"
+		elif [[ ${#skipped[@]} -gt 0 ]]; then
+			# Only a scheduled run skips, and every change to the lines brings an
+			# event run that checks them all: the status it set still stands.
+			state="" description="not due: $(IFS=';' && echo "${skipped[*]}")"
 		elif [[ ${#met[@]} -gt 0 ]]; then
 			description="met: $(IFS=';' && echo "${met[*]}")"
 			declare marker
@@ -451,6 +462,7 @@ function evaluate_pull_request() {
 			continue
 		fi
 		check_condition "${one}"
+		echo "#${number} Notify-when: ${dep_state}: ${dep_reason}" >&2
 		case "${dep_state}" in
 			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "${dep_reason}" "${hash}")") ;;
 			*) pending=$((pending + 1)) ;;
