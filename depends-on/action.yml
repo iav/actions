@@ -1,0 +1,37 @@
+name: "Pull request dependencies"
+author: "Igor Velkov"
+description: "Hold a pull request until the pull requests or git refs named on its Depends-on: lines are merged"
+inputs:
+  pull-requests:
+    description: "Pull request numbers to check, or 'all'; empty: the event's pull request, or all open ones"
+    required: false
+    default: ""
+  token:
+    description: "Token that sets commit statuses and comments; it must also read the repositories named in Depends-on: lines"
+    required: false
+    default: ${{ github.token }}
+  context:
+    description: "Name of the commit status; make it a required check"
+    required: false
+    default: "depends-on"
+  override-label:
+    description: "Label that releases the hold"
+    required: false
+    default: "depends-on: override"
+  override-role:
+    description: "Lowest repository role whose override label counts: admin, maintain, write"
+    required: false
+    default: "maintain"
+runs:
+  using: "composite"
+  steps:
+    - name: "Check Depends-on: lines"
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        DEPENDS_ON_REPOSITORY: ${{ github.repository }}
+        DEPENDS_ON_PULL_REQUESTS: ${{ inputs.pull-requests }}
+        DEPENDS_ON_CONTEXT: ${{ inputs.context }}
+        DEPENDS_ON_OVERRIDE_LABEL: ${{ inputs.override-label }}
+        DEPENDS_ON_OVERRIDE_ROLE: ${{ inputs.override-role }}
+      run: ${{ github.action_path }}/depends-on.sh
