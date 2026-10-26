@@ -2,22 +2,31 @@
 #
 # SPDX-License-Identifier: GPL-2.0
 #
-# Hold pull requests until what they depend on is merged.
+# Hold pull requests until what they depend on is merged, and tell pull
+# requests when what they watch has landed.
 #
-# Every open pull request gets a commit status (DEPENDS_ON_CONTEXT) on its
-# head commit: success when all its "Depends-on:" lines are met or a
+# "Depends-on:" lines hold an open pull request: its head commit gets a
+# commit status (DEPENDS_ON_CONTEXT), success when all lines are met or a
 # maintainer has set the override label, pending while one is not met yet,
 # failure when one can never be met or cannot be read. Make the status a
 # required check to block the merge.
 #
-# Dependency lines in the pull request body, one per line:
-#   Depends-on: #123                              pull request in this repository is merged
-#   Depends-on: owner/repo#123                    pull request on GitHub is merged
-#   Depends-on: https://github.com/owner/repo/pull/123
-#   Depends-on: owner/repo#123 released           ... and its merge commit is in the latest release
-#   Depends-on: owner/repo#123 in <branch|tag>    ... and its merge commit is in that branch or tag
-#   Depends-on: git <url> <branch|tag>            the ref exists in any git repository
-#   Depends-on: git <url> <ref|sha> in <ref>      that commit is reachable from <ref>
+# "Notify-when:" lines hold nothing: the pull request can be merged at once.
+# When a line is met, also after the merge, the pull request gets a comment.
+# While some line is not announced yet, the pull request carries the label
+# DEPENDS_ON_NOTIFY_LABEL, so that scheduled runs look at those pull
+# requests only and not at every merged one.
+#
+# Both take one condition per line:
+#   #123                                  pull request in this repository is merged
+#   owner/repo#123                        pull request on GitHub is merged
+#   https://github.com/owner/repo/pull/123
+#   owner/repo#123 released               ... and its merge commit is in the latest release
+#   owner/repo#123 in <branch|tag>        ... and its merge commit is in that branch or tag
+#   git <url> <branch|tag>                the ref exists in any git repository
+#   git <url> <ref|sha> in <ref>          that commit is reachable from <ref>
+#   git <url> contains "<text>" in <ref> after <tag>
+#                                         a commit message in <ref> after that tag has <text>
 #
 set -euo pipefail
 
@@ -25,11 +34,16 @@ repo="${DEPENDS_ON_REPOSITORY:?}"
 context="${DEPENDS_ON_CONTEXT:-depends-on}"
 override_label="${DEPENDS_ON_OVERRIDE_LABEL:-depends-on: override}"
 override_role="${DEPENDS_ON_OVERRIDE_ROLE:-maintain}"
-git_max_depth="${DEPENDS_ON_GIT_MAX_DEPTH:-100000}"
+notify_label="${DEPENDS_ON_NOTIFY_LABEL:-notify-pending}"
+notify_ttl_days="${DEPENDS_ON_NOTIFY_TTL_DAYS:-365}"
+git_every_hours="${DEPENDS_ON_GIT_EVERY_HOURS:-6}"
+git_max_fetches="${DEPENDS_ON_GIT_MAX_FETCHES:-10}"
+git_fetch_timeout="${DEPENDS_ON_GIT_FETCH_TIMEOUT:-300}"
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-# Result of check_dependency: ok, wait or bad, and a short reason.
+# Result of check_condition: ok, wait, bad, or skip (a git fetch not due in
+# this run), and a short reason.
 dep_state="" dep_reason=""
 
 # The body is anyone's text and the token can write: words from it reach git
@@ -37,9 +51,26 @@ dep_state="" dep_reason=""
 ref_pattern='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
 url_pattern='^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9_./~%+-]*$'
 
+# Fetching other git servers is the expensive part. On an event the user
+# waits for the answer; on the schedule it runs every git_every_hours only.
+git_due=yes
+if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" ]]; then
+	git_due=no
+	if (($(date -u +%-H) % git_every_hours == 0 && $(date -u +%-M) < 30)); then
+		git_due=yes
+	fi
+fi
+
+# One bare repository per URL, one fetch per URL and ref in a run.
+declare -A git_dirs=() git_fetched=()
+git_fetches=0
+work_dir="$(mktemp -d)"
+trap 'rm -rf "${work_dir}"' EXIT
+
 # git that speaks https only and runs nothing from the remote side.
+safe_git_options=(-c protocol.allow=never -c protocol.https.allow=always -c core.sshCommand=false)
 function safe_git() {
-	git -c protocol.allow=never -c protocol.https.allow=always -c core.sshCommand=false "$@"
+	git "${safe_git_options[@]}" "$@"
 }
 
 function role_rank() {
@@ -53,17 +84,22 @@ function role_rank() {
 	esac
 }
 
-# Print the "Depends-on:" values of a pull request body, one per line.
-# Lines inside fenced code blocks are skipped, so examples do not count.
-function parse_dependencies() {
-	tr -d '\r' | awk '
+# Print the values of the "<keyword>:" lines of a pull request body, one per
+# line. Lines inside fenced code blocks are skipped, so examples do not count.
+# <keyword>
+function parse_lines() {
+	tr -d '\r' | awk -v k="${1}" '
 		/^[[:space:]]*```/ { fenced = !fenced; next }
 		fenced { next }
-		tolower($0) ~ /^[[:space:]]*depends-on:/ {
+		index(tolower($0), k ":") == 1 || match(tolower($0), "^[[:space:]]+" k ":") {
 			sub(/^[^:]*:[[:space:]]*/, "")
 			sub(/[[:space:]]+$/, "")
 			if (length($0)) print
 		}'
+}
+
+function line_hash() {
+	printf '%s\n' "${1}" | sha1sum | cut -c1-12
 }
 
 # Is commit $3 contained in ref $4 of GitHub repository $1/$2?
@@ -138,6 +174,116 @@ function check_github_pull_request() {
 	esac
 }
 
+# Resolve ref $2 of $1 to a commit. Sets git_sha: empty if the ref does not
+# exist (yet). Returns 1 if the remote does not answer.
+function git_resolve() {
+	declare listed
+	git_sha=""
+	listed="$(safe_git ls-remote "${1}" "${2}" "${2}^{}" 2> /dev/null)" || return 1
+	# A peeled tag names the commit; prefer it over the tag object.
+	git_sha="$(awk '$2 ~ /\^\{\}$/ { print $1; exit } !first { first = $1 } END { if (first) print first }' <<< "${listed}" | head -n1)"
+}
+
+# One fetch into this run's repository for URL $1, within the time and count
+# limits. Logs it for the summary. Returns 0, 1 (failed), 2 (over the number
+# of fetches of this run) or 3 (over the time of one fetch).
+# <url> <what, for the log> <git fetch arguments>...
+function git_fetch_once() {
+	declare url="${1}" what="${2}" && shift 2
+	if ((git_fetches >= git_max_fetches)); then
+		return 2
+	fi
+	git_fetches=$((git_fetches + 1))
+	declare start=${SECONDS} rc=0
+	timeout --kill-after=10 "${git_fetch_timeout}" git "${safe_git_options[@]}" -C "${git_dir}" fetch -q --filter=tree:0 "$@" 2> /dev/null || rc=$?
+	echo "| ${url} | ${what} | $((SECONDS - start)) s | $( ((rc == 0)) && echo ok || echo "failed (${rc})") |" >> "${work_dir}/fetches"
+	if ((rc == 124 || rc == 137)); then
+		return 3
+	fi
+	((rc == 0)) || return 1
+}
+
+# Fetch the commits of ref $2 of $1, without trees or files where the server
+# can leave them out; with tag $3, only those after the tag where the server
+# can cut there, else all of them and the tag. Sets git_dir and git_range,
+# the local commits to search. Returns as git_fetch_once.
+function git_fetch() {
+	declare url="${1}" ref="${2}" after="${3:-}"
+	declare key="${url} ${ref} ${after}" mine rc=0
+	if [[ -z "${git_dirs[${url}]:-}" ]]; then
+		git_dirs[${url}]="${work_dir}/${#git_dirs[@]}"
+		git init -q --bare "${git_dirs[${url}]}"
+	fi
+	git_dir="${git_dirs[${url}]}"
+	mine="refs/depends-on/$(printf '%s' "${key}" | sha1sum | cut -c1-12)"
+	if [[ -n "${git_fetched[${key}]:-}" ]]; then
+		git_range="${git_fetched[${key}]#* }"
+		return "${git_fetched[${key}]%% *}"
+	fi
+	git_range="${mine}"
+	if [[ -n "${after}" ]]; then
+		git_fetch_once "${url}" "${ref} after ${after}" --shallow-exclude="${after}" "${url}" "+${ref}:${mine}" || rc=$?
+		if ((rc == 1)); then
+			# The server cannot cut at a tag: take the whole history and the tag.
+			rc=0
+			git_fetch_once "${url}" "${ref} and ${after}" "${url}" "+${ref}:${mine}" "+refs/tags/${after}:${mine}-after" || rc=$?
+			git_range="${mine}-after..${mine}"
+		fi
+	else
+		git_fetch_once "${url}" "${ref}" "${url}" "+${ref}:${mine}" || rc=$?
+	fi
+	git_fetched[${key}]="${rc} ${git_range}"
+	return "${rc}"
+}
+
+# Set dep_state and dep_reason for a git_fetch return code other than 0.
+function fetch_failed() {
+	case "${1}" in
+		1) dep_state=bad dep_reason="${2}: cannot fetch ${3}" ;;
+		2) dep_state=skip dep_reason="${2}: ${3} over the fetch limit of this run" ;;
+		*) dep_state=skip dep_reason="${2}: ${3} fetch over ${git_fetch_timeout} s" ;;
+	esac
+}
+
+# git <url> contains "<text>" in <ref> after <tag>
+function check_git_contains() {
+	declare url="${1}" text="${2}" container="${3}" after="${4}"
+	if [[ "${git_due}" != "yes" ]]; then
+		dep_state=skip dep_reason="${url}: ${container} not due in this run"
+		return
+	fi
+	if ! git_resolve "${url}" "${container}"; then
+		dep_state=bad dep_reason="${url}: cannot read"
+		return
+	fi
+	if [[ -z "${git_sha}" ]]; then
+		dep_state=wait dep_reason="${url}: no ${container} yet"
+		return
+	fi
+	if ! git_resolve "${url}" "refs/tags/${after}"; then
+		dep_state=bad dep_reason="${url}: cannot read"
+		return
+	fi
+	if [[ -z "${git_sha}" ]]; then
+		dep_state=bad dep_reason="${url}: no tag ${after}"
+		return
+	fi
+	declare rc=0 found
+	git_fetch "${url}" "${container}" "${after}" || rc=$?
+	if ((rc != 0)); then
+		fetch_failed "${rc}" "${url}" "${container}"
+		return
+	fi
+	# A merge can quote the subjects it brings in: prefer the commit itself.
+	found="$(git -C "${git_dir}" log --no-merges -F --grep="${text}" --format=%H -1 "${git_range}" 2> /dev/null || true)"
+	[[ -n "${found}" ]] || found="$(git -C "${git_dir}" log -F --grep="${text}" --format=%H -1 "${git_range}" 2> /dev/null || true)"
+	if [[ -n "${found}" ]]; then
+		dep_state=ok dep_reason="${url}: in ${container} as ${found:0:12}"
+	else
+		dep_state=wait dep_reason="${url}: not in ${container} after ${after}"
+	fi
+}
+
 # git <url> <ref|sha> [in <ref>]
 function check_git() {
 	declare url="${1:-}" ref="${2:-}" keyword="${3:-}" container="${4:-}"
@@ -149,16 +295,15 @@ function check_git() {
 		dep_state=bad dep_reason="git: only https:// URLs and plain ref names"
 		return
 	fi
-	declare sha="" listed
+	declare sha
 	if [[ "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
 		sha="${ref}"
 	else
-		if ! listed="$(safe_git ls-remote "${url}" "${ref}" "${ref}^{}" 2> /dev/null)"; then
+		if ! git_resolve "${url}" "${ref}"; then
 			dep_state=bad dep_reason="${url}: cannot read"
 			return
 		fi
-		# A peeled tag names the commit; prefer it over the tag object.
-		sha="$(awk -v r="${ref}" '$2 ~ "\\^\\{\\}$" { print $1; exit } { first = first ? first : $1 } END { if (first) print first }' <<< "${listed}" | head -n1)"
+		sha="${git_sha}"
 		if [[ -z "${sha}" ]]; then
 			dep_state=wait dep_reason="${url}: no ${ref} yet"
 			return
@@ -184,33 +329,42 @@ function check_git() {
 		fi
 		return
 	fi
-	declare tmp depth fetched
-	tmp="$(mktemp -d)"
-	git init -q --bare "${tmp}"
-	dep_state=wait dep_reason="${url}: ${ref} not in ${container} within ${git_max_depth} commits"
-	for depth in 100 1000 10000 "${git_max_depth}"; do
-		if ! safe_git -C "${tmp}" fetch -q --filter=tree:0 --depth="${depth}" "${url}" "${container}" 2> /dev/null; then
-			dep_state=bad dep_reason="${url}: cannot fetch ${container}"
-			break
-		fi
-		if git -C "${tmp}" cat-file -e "${sha}^{commit}" 2> /dev/null; then
-			dep_state=ok dep_reason="${url}: ${ref} in ${container}"
-			break
-		fi
-		fetched="$(git -C "${tmp}" rev-list --count FETCH_HEAD)"
-		if [[ "${fetched}" -lt "${depth}" ]]; then
-			dep_state=wait dep_reason="${url}: ${ref} not in ${container}"
-			break
-		fi
-		[[ "${depth}" -ge "${git_max_depth}" ]] && break
-	done
-	rm -rf "${tmp}"
+	if [[ "${git_due}" != "yes" ]]; then
+		dep_state=skip dep_reason="${url}: ${container} not due in this run"
+		return
+	fi
+	if ! git_resolve "${url}" "${container}"; then
+		dep_state=bad dep_reason="${url}: cannot read"
+		return
+	fi
+	if [[ -z "${git_sha}" ]]; then
+		dep_state=wait dep_reason="${url}: no ${container} yet"
+		return
+	fi
+	declare rc=0
+	git_fetch "${url}" "${container}" || rc=$?
+	if ((rc != 0)); then
+		fetch_failed "${rc}" "${url}" "${container}"
+	elif git -C "${git_dir}" merge-base --is-ancestor "${sha}" "${git_range}" 2> /dev/null; then
+		dep_state=ok dep_reason="${url}: ${ref} in ${container}"
+	else
+		dep_state=wait dep_reason="${url}: ${ref} not in ${container}"
+	fi
 }
 
-function check_dependency() {
+function check_condition() {
+	dep_state="" dep_reason=""
+	if [[ "${1}" =~ ^[Gg][Ii][Tt][[:space:]]+([^[:space:]]+)[[:space:]]+contains[[:space:]]+\"([^\"]{1,200})\"[[:space:]]+in[[:space:]]+([^[:space:]]+)[[:space:]]+after[[:space:]]+([^[:space:]]+)$ ]]; then
+		declare url="${BASH_REMATCH[1]}" text="${BASH_REMATCH[2]}" container="${BASH_REMATCH[3]}" after="${BASH_REMATCH[4]}"
+		if [[ ! "${url}" =~ ${url_pattern} || ! "${container}" =~ ${ref_pattern} || ! "${after}" =~ ${ref_pattern} ]]; then
+			dep_state=bad dep_reason="git: only https:// URLs and plain ref names"
+			return
+		fi
+		check_git_contains "${url}" "${text}" "${container}" "${after}"
+		return
+	fi
 	declare -a words
 	read -r -a words <<< "${1}"
-	dep_state="" dep_reason=""
 	if [[ "${words[0],,}" == "git" ]]; then
 		check_git "${words[@]:1}"
 	else
@@ -224,119 +378,159 @@ function override_actor() {
 		jq -rs --arg l "${override_label}" '[.[][] | select(.event == "labeled" and .label.name == $l)] | last | .actor.login // empty'
 }
 
-# Print the comment that announces to pull request $1 that all of its
-# dependencies are met, or nothing if it was already posted for this set of
-# dependencies: the hidden marker carries a hash of the set.
-# <number> <reason>...
-function met_comment() {
-	declare number="${1}" && shift
-	declare hash marker one
-	hash="$(printf '%s\n' "${deps[@]}" | sort | sha1sum | cut -c1-12)"
-	marker="<!-- depends-on: met ${hash} -->"
-	if gh api --paginate "repos/${repo}/issues/${number}/comments?per_page=100" --jq '.[].body' 2> /dev/null | grep -qF "${marker}"; then
-		return 0
-	fi
-	echo "All dependencies are met:"
-	for one in "$@"; do
-		echo "- ${one}"
-	done
-	echo
-	echo "${marker}"
-}
-
-# Print one JSON object with the decision for pull request $1. Needs read access only.
+# Print one JSON object with the decision for pull request $1. Needs read
+# access only. state empty: leave the status alone. comments: texts to post.
+# label: add or remove the notify label, or nothing.
 function evaluate_pull_request() {
-	declare number="${1}" pr sha body labels
+	declare number="${1}" pr sha body labels pr_state merged_at comments
 	pr="$(gh api "repos/${repo}/pulls/${number}")"
 	sha="$(jq -r '.head.sha' <<< "${pr}")"
 	body="$(jq -r '.body // ""' <<< "${pr}")"
 	labels="$(jq -r '.labels[].name' <<< "${pr}")"
+	pr_state="$(jq -r '.state' <<< "${pr}")"
+	merged_at="$(jq -r '.merged_at // ""' <<< "${pr}")"
+	comments="$(gh api --paginate "repos/${repo}/issues/${number}/comments?per_page=100" --jq '.[].body' 2> /dev/null || true)"
 
-	declare -a deps
-	mapfile -t deps < <(parse_dependencies <<< "${body}")
+	declare -a deps notifies new_comments=()
+	mapfile -t deps < <(parse_lines "depends-on" <<< "${body}")
+	mapfile -t notifies < <(parse_lines "notify-when" <<< "${body}")
 
-	declare state=success description="no dependencies" comment="" one
-	declare -a waiting=() broken=() met=()
-	for one in "${deps[@]}"; do
-		check_dependency "${one}"
-		case "${dep_state}" in
-			ok) met+=("${dep_reason}") ;;
-			wait) waiting+=("${dep_reason}") ;;
-			*) broken+=("${dep_reason}") ;;
-		esac
-	done
-	if [[ ${#broken[@]} -gt 0 ]]; then
-		state=failure description="$(IFS=';' && echo "${broken[*]}")"
-	elif [[ ${#waiting[@]} -gt 0 ]]; then
-		state=pending description="waiting: $(IFS=';' && echo "${waiting[*]}")"
-	elif [[ ${#met[@]} -gt 0 ]]; then
-		description="met: $(IFS=';' && echo "${met[*]}")"
-		comment="$(met_comment "${number}" "${met[@]}")"
-	fi
-
-	if [[ "${state}" != "success" ]] && grep -qxF "${override_label}" <<< "${labels}"; then
-		declare actor role
-		actor="$(override_actor "${number}")"
-		role="$(gh api "repos/${repo}/collaborators/${actor:-none}/permission" --jq '.role_name' 2> /dev/null || true)"
-		if [[ -n "${actor}" && "$(role_rank "${role}")" -ge "$(role_rank "${override_role}")" ]]; then
-			state=success description="overridden by @${actor} (${role})"
-		else
-			description="override label ignored: @${actor:-unknown} is ${role:-not a collaborator}; ${description}"
+	# Depends-on: a status on open pull requests only.
+	declare state="" description="" one
+	if [[ "${pr_state}" == "open" ]]; then
+		declare -a waiting=() broken=() met=() skipped=()
+		for one in "${deps[@]}"; do
+			check_condition "${one}"
+			case "${dep_state}" in
+				ok) met+=("${dep_reason}") ;;
+				wait) waiting+=("${dep_reason}") ;;
+				skip) skipped+=("${dep_reason}") ;;
+				*) broken+=("${dep_reason}") ;;
+			esac
+		done
+		state=success description="no dependencies"
+		if [[ ${#broken[@]} -gt 0 ]]; then
+			state=failure description="$(IFS=';' && echo "${broken[*]}")"
+		elif [[ ${#skipped[@]} -gt 0 ]]; then
+			state="" description="not due: $(IFS=';' && echo "${skipped[*]}")"
+		elif [[ ${#waiting[@]} -gt 0 ]]; then
+			state=pending description="waiting: $(IFS=';' && echo "${waiting[*]}")"
+		elif [[ ${#met[@]} -gt 0 ]]; then
+			description="met: $(IFS=';' && echo "${met[*]}")"
+			declare marker
+			marker="<!-- depends-on: met $(printf '%s\n' "${deps[@]}" | LC_ALL=C sort | sha1sum | cut -c1-12) -->"
+			if ! grep -qF "${marker}" <<< "${comments}"; then
+				new_comments+=("$(printf 'All dependencies are met:\n%s\n\n%s' "$(printf -- '- %s\n' "${met[@]}")" "${marker}")")
+			fi
+		fi
+		if [[ -n "${state}" && "${state}" != "success" ]] && grep -qxF "${override_label}" <<< "${labels}"; then
+			declare actor role
+			actor="$(override_actor "${number}")"
+			role="$(gh api "repos/${repo}/collaborators/${actor:-none}/permission" --jq '.role_name' 2> /dev/null || true)"
+			if [[ -n "${actor}" && "$(role_rank "${role}")" -ge "$(role_rank "${override_role}")" ]]; then
+				state=success description="overridden by @${actor} (${role})"
+			else
+				description="override label ignored: @${actor:-unknown} is ${role:-not a collaborator}; ${description}"
+			fi
 		fi
 	fi
 
-	echo "#${number} ${sha:0:12} ${state}: ${description}" >&2
-	echo "| #${number} | ${state} | ${description//|/\\|} |" >> "${summary}"
-	jq -nc --argjson number "${number}" --arg sha "${sha}" --arg state "${state}" \
-		--arg description "${description:0:140}" --arg comment "${comment}" \
-		'{number: $number, sha: $sha, state: $state, description: $description, comment: $comment}'
+	# Notify-when: one comment per line, also after the merge.
+	declare label="" pending=0 hash expired=no
+	if [[ -n "${merged_at}" ]] && (($(date -u +%s) - $(date -u -d "${merged_at}" +%s) > notify_ttl_days * 86400)); then
+		expired=yes
+	fi
+	for one in "${notifies[@]}"; do
+		hash="$(line_hash "${one}")"
+		grep -qF "<!-- notify-when: ${hash} -->" <<< "${comments}" && continue
+		if [[ "${pr_state}" == "closed" && -z "${merged_at}" ]]; then
+			continue # closed without merge: nothing to watch for
+		fi
+		if [[ "${expired}" == "yes" ]]; then
+			new_comments+=("$(printf 'Notify-when gave up after %s days:\n- %s\n\n<!-- notify-when: %s -->' "${notify_ttl_days}" "${hash}" "${hash}")")
+			continue
+		fi
+		check_condition "${one}"
+		case "${dep_state}" in
+			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "${dep_reason}" "${hash}")") ;;
+			*) pending=$((pending + 1)) ;;
+		esac
+	done
+	if ((pending > 0)); then
+		grep -qxF "${notify_label}" <<< "${labels}" || label=add
+	else
+		grep -qxF "${notify_label}" <<< "${labels}" && label=remove
+	fi
+
+	echo "#${number} ${sha:0:12} ${state:-unchanged}: ${description} notify-pending=${pending} label=${label:-none}" >&2
+	echo "| #${number} | ${state:-unchanged} | ${description//|/\\|} | ${pending} |" >> "${summary}"
+	printf '%s\0' "${new_comments[@]}" | jq -Rsc --argjson number "${number}" --arg sha "${sha}" \
+		--arg state "${state}" --arg description "${description:0:140}" --arg label "${label}" \
+		'{number: $number, sha: $sha, state: $state, description: $description, label: $label,
+		comments: (split("\u0000") | map(select(length > 0)))}'
 }
 
-# Is $1 the comment met_comment writes: the heading, "- " items, the marker?
-function is_met_comment() {
+# Is $1 one of the comments evaluate_pull_request writes: a fixed heading,
+# "- " items, a marker of 12 hex digits?
+function is_known_comment() {
 	[[ ${#1} -le 4000 ]] || return 1
 	declare -a lines
 	mapfile -t lines <<< "${1}"
 	declare last=$((${#lines[@]} - 1)) i
-	[[ "${lines[0]}" == "All dependencies are met:" ]] || return 1
-	[[ "${lines[last]}" =~ ^\<!--\ depends-on:\ met\ [0-9a-f]{12}\ --\>$ ]] || return 1
+	case "${lines[0]}" in
+		"All dependencies are met:")
+			[[ "${lines[last]}" =~ ^\<!--\ depends-on:\ met\ [0-9a-f]{12}\ --\>$ ]] || return 1
+			;;
+		"Notify-when met:" | "Notify-when gave up after "[0-9]*" days:")
+			[[ "${lines[last]}" =~ ^\<!--\ notify-when:\ [0-9a-f]{12}\ --\>$ ]] || return 1
+			;;
+		*)
+			return 1
+			;;
+	esac
 	for ((i = 1; i < last; i++)); do
 		[[ -z "${lines[i]}" || "${lines[i]}" == "- "* ]] || return 1
 	done
 }
 
-# Set the statuses and post the comments of a JSON array of decisions. Needs
-# write access, reads no pull request body. The decisions come from the
-# evaluate step and are trusted as far as that step is: a forged one can at
-# most hit the head commit of an open pull request it names, with a comment
-# of the fixed shape.
+# Carry out a JSON array of decisions. Needs write access, reads no pull
+# request body. The decisions come from the evaluate step and are trusted as
+# far as that step is: a forged one can at most set the status of the head
+# commit of an open pull request it names, post a comment of a fixed shape,
+# and add or remove the notify label.
 function apply_decisions() {
-	declare item number sha state description comment head
+	declare item number sha state description label head one
 	while IFS= read -r item; do
 		number="$(jq -r '.number' <<< "${item}")"
 		sha="$(jq -r '.sha' <<< "${item}")"
 		state="$(jq -r '.state' <<< "${item}")"
 		description="$(jq -r '.description' <<< "${item}")"
-		comment="$(jq -r '.comment' <<< "${item}")"
-		if [[ ! "${number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ || ! "${state}" =~ ^(success|pending|failure)$ ]]; then
+		label="$(jq -r '.label' <<< "${item}")"
+		if [[ ! "${number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ || ! "${state}" =~ ^(success|pending|failure|)$ || ! "${label}" =~ ^(add|remove|)$ ]]; then
 			echo "Skipping a malformed decision: ${item:0:200}" >&2
 			continue
 		fi
-		head="$(gh api "repos/${repo}/pulls/${number}" --jq 'select(.state == "open") | .head.sha' 2> /dev/null || true)"
-		if [[ "${head}" != "${sha}" ]]; then
-			echo "Skipping #${number}: ${sha:0:12} is not the head of an open pull request (now ${head:-none})" >&2
-			continue
+		if [[ -n "${state}" ]]; then
+			head="$(gh api "repos/${repo}/pulls/${number}" --jq 'select(.state == "open") | .head.sha' 2> /dev/null || true)"
+			if [[ "${head}" == "${sha}" ]]; then
+				gh api -X POST "repos/${repo}/statuses/${sha}" -f state="${state}" -f context="${context}" \
+					-f description="${description:0:140}" -f target_url="${run_url}" > /dev/null
+			else
+				echo "Not setting a status on #${number}: ${sha:0:12} is not the head of an open pull request (now ${head:-none})" >&2
+			fi
 		fi
-		if [[ -n "${comment}" ]] && ! is_met_comment "${comment}"; then
-			echo "Dropping an unexpected comment for #${number}" >&2
-			comment=""
-		fi
-		gh api -X POST "repos/${repo}/statuses/${sha}" -f state="${state}" -f context="${context}" \
-			-f description="${description:0:140}" -f target_url="${run_url}" > /dev/null
-		if [[ -n "${comment}" ]]; then
-			gh api -X POST "repos/${repo}/issues/${number}/comments" -f body="${comment}" > /dev/null
-		fi
-		echo "#${number} ${sha:0:12} ${state}"
+		while IFS= read -r -d '' one; do
+			if is_known_comment "${one}"; then
+				gh api -X POST "repos/${repo}/issues/${number}/comments" -f body="${one}" > /dev/null
+			else
+				echo "Dropping an unexpected comment for #${number}" >&2
+			fi
+		done < <(jq -j '.comments[] | ., "\u0000"' <<< "${item}")
+		case "${label}" in
+			add) gh api -X POST "repos/${repo}/issues/${number}/labels" -f "labels[]=${notify_label}" > /dev/null ;;
+			remove) gh api -X DELETE "repos/${repo}/issues/${number}/labels/$(jq -rn --arg l "${notify_label}" '$l|@uri')" > /dev/null 2>&1 || true ;;
+		esac
+		echo "#${number} ${sha:0:12} ${state:-unchanged} label=${label:-none}"
 	done < <(jq -c '.[]' <<< "${1}")
 }
 
@@ -345,33 +539,46 @@ function pull_requests_to_check() {
 		tr ' ,' '\n\n' <<< "${DEPENDS_ON_PULL_REQUESTS}" | awk 'NF'
 		return
 	fi
-	# A closed pull request may be what others wait for: check them all.
 	if [[ -z "${DEPENDS_ON_PULL_REQUESTS:-}" && -r "${GITHUB_EVENT_PATH:-}" ]]; then
 		declare number action
 		number="$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH}")"
 		action="$(jq -r '.action // empty' "${GITHUB_EVENT_PATH}")"
-		if [[ -n "${number}" && "${action}" != "closed" ]]; then
+		if [[ -n "${number}" ]]; then
 			echo "${number}"
-			return
+			# A closed pull request may be what others wait for: check them all.
+			[[ "${action}" == "closed" ]] || return 0
 		fi
 	fi
-	gh api --paginate "repos/${repo}/pulls?state=open&per_page=100" --jq '.[].number'
+	{
+		gh api --paginate "repos/${repo}/pulls?state=open&per_page=100" --jq '.[].number'
+		# Merged pull requests are watched only while they carry the notify label.
+		gh api --paginate "repos/${repo}/issues?state=all&per_page=100&labels=$(jq -rn --arg l "${notify_label}" '$l|@uri')" \
+			--jq '.[] | select(.pull_request) | .number'
+	} | awk '!seen[$0]++'
 }
 
 # Print the decisions for the pull requests to check as a JSON array.
 function evaluate() {
 	{
-		echo "| Pull request | State | Details |"
-		echo "|---|---|---|"
+		echo "| Pull request | Status | Details | Notify pending |"
+		echo "|---|---|---|---|"
 	} >> "${summary}"
 	declare one_pr
 	while read -r one_pr; do
 		evaluate_pull_request "${one_pr}"
 	done < <(pull_requests_to_check) | jq -sc '.'
+	if [[ -s "${work_dir}/fetches" ]]; then
+		{
+			echo
+			echo "| Fetched from | Ref | Commits | Time | Result |"
+			echo "|---|---|---|---|---|"
+			cat "${work_dir}/fetches"
+		} >> "${summary}"
+	fi
 }
 
 # evaluate: read-only, writes the decisions to the step output 'result'.
-# apply: sets statuses and comments from DEPENDS_ON_RESULT.
+# apply: carries out the decisions in DEPENDS_ON_RESULT.
 # all: both in one step, with one token.
 function main() {
 	declare result
