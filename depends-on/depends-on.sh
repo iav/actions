@@ -60,7 +60,9 @@ done <<- LINKS
 	gitlab.freedesktop.org https://gitlab.freedesktop.org/{repo}/-/commit/{sha}
 	salsa.debian.org https://salsa.debian.org/{repo}/-/commit/{sha}
 	codeberg.org https://codeberg.org/{repo}/commit/{sha}
+	git.sr.ht https://git.sr.ht/{repo}/commit/{sha}
 	git.kernel.org https://git.kernel.org/{path}/commit/?id={sha}
+	git.openwrt.org https://git.openwrt.org/{repo}/commit/?id={sha}
 	${DEPENDS_ON_COMMIT_LINKS:-}
 LINKS
 
@@ -134,6 +136,18 @@ function set_commit_link() {
 	template="${template//\{repo\}/${path%.git}}"
 	template="${template//\{path\}/${path}}"
 	dep_link="[${sha:0:12}](${template//\{sha\}/${sha}})"
+}
+
+# Print dep_reason for a comment: a short commit at its end becomes the link,
+# else the link follows in parentheses.
+function linked_reason() {
+	if [[ -z "${dep_link}" ]]; then
+		echo "${dep_reason}"
+	elif [[ "${dep_link}" == "["* && "${dep_reason}" == *" ${dep_link:1:12}" ]]; then
+		echo "${dep_reason% *} ${dep_link}"
+	else
+		echo "${dep_reason} (${dep_link})"
+	fi
 }
 
 # Is commit $3 contained in ref $4 of GitHub repository $1/$2?
@@ -450,7 +464,7 @@ function evaluate_pull_request() {
 			case "${dep_state}" in
 				ok)
 					met+=("${dep_reason}")
-					met_linked+=("${dep_reason}${dep_link:+ (${dep_link})}")
+					met_linked+=("$(linked_reason)")
 					;;
 				wait) waiting+=("${dep_reason}") ;;
 				skip) skipped+=("${dep_reason}") ;;
@@ -504,7 +518,7 @@ function evaluate_pull_request() {
 		check_condition "${one}"
 		echo "#${number} Notify-when: ${dep_state}: ${dep_reason}" >&2
 		case "${dep_state}" in
-			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "${dep_reason}${dep_link:+ (${dep_link})}" "${hash}")") ;;
+			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "$(linked_reason)" "${hash}")") ;;
 			*) pending=$((pending + 1)) ;;
 		esac
 	done
