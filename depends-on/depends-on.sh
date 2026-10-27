@@ -44,8 +44,25 @@ run_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 # Result of check_condition: ok, wait, bad, or skip (a git fetch not due in
-# this run), and a short reason.
-dep_state="" dep_reason=""
+# this run), a short reason, and for comments a link to the commit found.
+dep_state="" dep_reason="" dep_link=""
+
+# Commit page per host: {repo} is the URL path without ".git", {path} the
+# path as given, {sha} the full commit. DEPENDS_ON_COMMIT_LINKS adds or
+# overrides lines of the same form.
+declare -A commit_links=()
+while read -r one_host one_template; do
+	[[ -n "${one_host}" && -n "${one_template}" ]] && commit_links[${one_host}]="${one_template}"
+done <<- LINKS
+	github.com https://github.com/{repo}/commit/{sha}
+	gitlab.com https://gitlab.com/{repo}/-/commit/{sha}
+	source.denx.de https://source.denx.de/{repo}/-/commit/{sha}
+	gitlab.freedesktop.org https://gitlab.freedesktop.org/{repo}/-/commit/{sha}
+	salsa.debian.org https://salsa.debian.org/{repo}/-/commit/{sha}
+	codeberg.org https://codeberg.org/{repo}/commit/{sha}
+	git.kernel.org https://git.kernel.org/{path}/commit/?id={sha}
+	${DEPENDS_ON_COMMIT_LINKS:-}
+LINKS
 
 # The body is anyone's text and the token can write: words from it reach git
 # and the API only in these shapes, never as an option.
@@ -101,6 +118,22 @@ function parse_lines() {
 
 function line_hash() {
 	printf '%s\n' "${1}" | sha1sum | cut -c1-12
+}
+
+# Set dep_link to a Markdown link to commit $2 of repository URL $1, or to
+# the full commit and the repository when the host has no template.
+function set_commit_link() {
+	declare url="${1}" sha="${2}" host path template
+	[[ "${url}" =~ ^https://([^/:]+)(:[0-9]+)?/(.*)$ ]] || return 0
+	host="${BASH_REMATCH[1]}" path="${BASH_REMATCH[3]%/}"
+	template="${commit_links[${host}]:-}"
+	if [[ -z "${template}" ]]; then
+		dep_link="\`${sha}\` in ${url}"
+		return 0
+	fi
+	template="${template//\{repo\}/${path%.git}}"
+	template="${template//\{path\}/${path}}"
+	dep_link="[${sha:0:12}](${template//\{sha\}/${sha}})"
 }
 
 # Is commit $3 contained in ref $4 of GitHub repository $1/$2?
@@ -281,6 +314,7 @@ function check_git_contains() {
 	[[ -n "${found}" ]] || found="$(git -C "${git_dir}" log -F --grep="${text}" --format=%H -1 "${git_range}" 2> /dev/null || true)"
 	if [[ -n "${found}" ]]; then
 		dep_state=ok dep_reason="${url}: in ${container} as ${found:0:12}"
+		set_commit_link "${url}" "${found}"
 	else
 		dep_state=wait dep_reason="${url}: not in ${container} after ${after}"
 	fi
@@ -316,6 +350,7 @@ function check_git() {
 			dep_state=bad dep_reason="${url}: a commit needs 'in <ref>'"
 		else
 			dep_state=ok dep_reason="${url}: ${ref} exists"
+			set_commit_link "${url}" "${sha}"
 		fi
 		return
 	fi
@@ -324,6 +359,7 @@ function check_git() {
 		declare owner="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]%.git}"
 		if github_contains "${owner}" "${name}" "${sha}" "${container}"; then
 			dep_state=ok dep_reason="${owner}/${name}: ${ref} in ${container}"
+			set_commit_link "${url}" "${sha}"
 		elif [[ $? -eq 2 ]]; then
 			dep_state=wait dep_reason="${owner}/${name}: cannot compare ${ref} with ${container}"
 		else
@@ -349,13 +385,14 @@ function check_git() {
 		fetch_failed "${rc}" "${url}" "${container}"
 	elif git -C "${git_dir}" merge-base --is-ancestor "${sha}" "${git_range}" 2> /dev/null; then
 		dep_state=ok dep_reason="${url}: ${ref} in ${container}"
+		set_commit_link "${url}" "${sha}"
 	else
 		dep_state=wait dep_reason="${url}: ${ref} not in ${container}"
 	fi
 }
 
 function check_condition() {
-	dep_state="" dep_reason=""
+	dep_state="" dep_reason="" dep_link=""
 	if [[ "${1}" =~ ^[Gg][Ii][Tt][[:space:]]+([^[:space:]]+)[[:space:]]+contains[[:space:]]+\"([^\"]{1,200})\"[[:space:]]+in[[:space:]]+([^[:space:]]+)[[:space:]]+after[[:space:]]+([^[:space:]]+)$ ]]; then
 		declare url="${BASH_REMATCH[1]}" text="${BASH_REMATCH[2]}" container="${BASH_REMATCH[3]}" after="${BASH_REMATCH[4]}"
 		if [[ ! "${url}" =~ ${url_pattern} || ! "${container}" =~ ${ref_pattern} || ! "${after}" =~ ${ref_pattern} ]]; then
@@ -402,7 +439,7 @@ function evaluate_pull_request() {
 	# Depends-on: a status on open pull requests only.
 	declare state="" description="" one
 	if [[ "${pr_state}" == "open" ]]; then
-		declare -a waiting=() broken=() met=() skipped=()
+		declare -a waiting=() broken=() met=() met_linked=() skipped=()
 		if ((${#deps[@]} + ${#notifies[@]} > max_lines)); then
 			broken+=("more than ${max_lines} Depends-on and Notify-when lines")
 			deps=() notifies=()
@@ -411,7 +448,10 @@ function evaluate_pull_request() {
 			check_condition "${one}"
 			echo "#${number} Depends-on: ${dep_state}: ${dep_reason}" >&2
 			case "${dep_state}" in
-				ok) met+=("${dep_reason}") ;;
+				ok)
+					met+=("${dep_reason}")
+					met_linked+=("${dep_reason}${dep_link:+ (${dep_link})}")
+					;;
 				wait) waiting+=("${dep_reason}") ;;
 				skip) skipped+=("${dep_reason}") ;;
 				*) broken+=("${dep_reason}") ;;
@@ -431,7 +471,7 @@ function evaluate_pull_request() {
 			declare marker
 			marker="<!-- depends-on: met $(printf '%s\n' "${deps[@]}" | LC_ALL=C sort | sha1sum | cut -c1-12) -->"
 			if ! grep -qF "${marker}" <<< "${comments}"; then
-				new_comments+=("$(printf 'All dependencies are met:\n%s\n\n%s' "$(printf -- '- %s\n' "${met[@]}")" "${marker}")")
+				new_comments+=("$(printf 'All dependencies are met:\n%s\n\n%s' "$(printf -- '- %s\n' "${met_linked[@]}")" "${marker}")")
 			fi
 		fi
 		if [[ -n "${state}" && "${state}" != "success" ]] && grep -qxF "${override_label}" <<< "${labels}"; then
@@ -464,7 +504,7 @@ function evaluate_pull_request() {
 		check_condition "${one}"
 		echo "#${number} Notify-when: ${dep_state}: ${dep_reason}" >&2
 		case "${dep_state}" in
-			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "${dep_reason}" "${hash}")") ;;
+			ok) new_comments+=("$(printf 'Notify-when met:\n- %s\n\n<!-- notify-when: %s -->' "${dep_reason}${dep_link:+ (${dep_link})}" "${hash}")") ;;
 			*) pending=$((pending + 1)) ;;
 		esac
 	done

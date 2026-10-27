@@ -30,6 +30,10 @@ inputs:
     description: "Lowest repository role whose override label counts: admin, maintain, write"
     required: false
     default: "maintain"
+  commit-links:
+    description: "Extra commit page templates, one '<host> <URL>' per line, with {repo} (path without .git), {path} and {sha}"
+    required: false
+    default: ""
 outputs:
   result:
     description: "Decisions of mode evaluate, for mode apply"
@@ -49,4 +53,5 @@ runs:
         DEPENDS_ON_CONTEXT: ${{ inputs.context }}
         DEPENDS_ON_OVERRIDE_LABEL: ${{ inputs.override-label }}
         DEPENDS_ON_OVERRIDE_ROLE: ${{ inputs.override-role }}
+        DEPENDS_ON_COMMIT_LINKS: ${{ inputs.commit-links }}
       run: ${{ github.action_path }}/depends-on.sh
