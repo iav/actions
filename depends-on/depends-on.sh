@@ -2,31 +2,9 @@
 #
 # SPDX-License-Identifier: GPL-2.0
 #
-# Hold pull requests until what they depend on is merged, and tell pull
-# requests when what they watch has landed.
-#
-# "Depends-on:" lines hold an open pull request: its head commit gets a
-# commit status (DEPENDS_ON_CONTEXT), success when all lines are met or a
-# maintainer has set the override label, pending while one is not met yet,
-# failure when one can never be met or cannot be read. Make the status a
-# required check to block the merge.
-#
-# "Notify-when:" lines hold nothing: the pull request can be merged at once.
-# When a line is met, also after the merge, the pull request gets a comment.
-# While some line is not announced yet, the pull request carries the label
-# DEPENDS_ON_NOTIFY_LABEL, so that scheduled runs look at those pull
-# requests only and not at every merged one.
-#
-# Both take one condition per line:
-#   #123                                  pull request in this repository is merged
-#   owner/repo#123                        pull request on GitHub is merged
-#   https://github.com/owner/repo/pull/123
-#   owner/repo#123 released               ... and its merge commit is in the latest release
-#   owner/repo#123 in <branch|tag>        ... and its merge commit is in that branch or tag
-#   git <url> <branch|tag>                the ref exists in any git repository
-#   git <url> <ref|sha> in <ref>          that commit is reachable from <ref>
-#   git <url> contains "<text>" in <ref> after <tag>
-#                                         a commit message in <ref> after that tag has <text>
+# Hold pull requests on their "Depends-on:" lines and comment on them when
+# their "Notify-when:" lines are met. The forms of a line, the statuses and
+# the settings are described in README.md.
 #
 set -euo pipefail
 
@@ -93,13 +71,13 @@ if [[ "${GITHUB_EVENT_NAME:-}" == "schedule" ]]; then
 	fi
 fi
 
-# One bare repository per URL, one fetch per URL and ref in a run.
+# One bare repository per URL, shared by all conditions of a run.
 declare -A git_dirs=() git_fetched=()
 git_fetches=0
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 
-# git that speaks https only and runs nothing from the remote side.
+# git limited to https: a line cannot name ext::, ssh or file transports.
 safe_git_options=(-c protocol.allow=never -c protocol.https.allow=always -c core.sshCommand=false)
 function safe_git() {
 	git "${safe_git_options[@]}" "$@"
@@ -117,7 +95,7 @@ function role_rank() {
 }
 
 # Print the values of the "<keyword>:" lines of a pull request body, one per
-# line. Lines inside fenced code blocks are skipped, so examples do not count.
+# line. We skip lines inside fenced code blocks, so that examples do not count.
 # <keyword>
 function parse_lines() {
 	tr -d '\r' | awk -v k="${1}" '
@@ -284,7 +262,7 @@ function git_fetch() {
 	if [[ -n "${after}" ]]; then
 		git_fetch_once "${url}" "${ref} after ${after}" --shallow-exclude="${after}" "${url}" "+${ref}:${mine}" || rc=$?
 		if ((rc == 1)); then
-			# The server cannot cut at a tag: take the whole history and the tag.
+			# If the cut fails, take the whole history and the tag.
 			rc=0
 			git_fetch_once "${url}" "${ref} and ${after}" "${url}" "+${ref}:${mine}" "+refs/tags/${after}:${mine}-after" || rc=$?
 			git_range="${mine}-after..${mine}"
@@ -459,7 +437,7 @@ function evaluate_pull_request() {
 	declare -a deps notifies new_comments=()
 	mapfile -t deps < <(parse_lines "depends-on" <<< "${body}")
 	mapfile -t notifies < <(parse_lines "notify-when" <<< "${body}")
-	# Merged pull requests are watched too: cap their lines as well.
+	# We watch merged pull requests too: cap their lines as well.
 	[[ "${pr_state}" == "open" ]] || notifies=("${notifies[@]:0:max_lines}")
 
 	# Depends-on: a status on open pull requests only.
