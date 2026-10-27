@@ -57,6 +57,7 @@ done <<- LINKS
 	github.com https://github.com/{repo}/commit/{sha}
 	gitlab.com https://gitlab.com/{repo}/-/commit/{sha}
 	source.denx.de https://source.denx.de/{repo}/-/commit/{sha}
+	git.u-boot-project.org https://git.u-boot-project.org/{repo}/-/commit/{sha}
 	gitlab.freedesktop.org https://gitlab.freedesktop.org/{repo}/-/commit/{sha}
 	salsa.debian.org https://salsa.debian.org/{repo}/-/commit/{sha}
 	codeberg.org https://codeberg.org/{repo}/commit/{sha}
