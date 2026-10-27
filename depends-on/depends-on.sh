@@ -40,6 +40,17 @@ git_every_hours="${DEPENDS_ON_GIT_EVERY_HOURS:-6}"
 git_max_fetches="${DEPENDS_ON_GIT_MAX_FETCHES:-10}"
 git_fetch_timeout="${DEPENDS_ON_GIT_FETCH_TIMEOUT:-300}"
 max_lines="${DEPENDS_ON_MAX_LINES:-20}"
+# These go into shell arithmetic, which would run anything but a number.
+for one_setting in notify_ttl_days git_every_hours git_max_fetches git_fetch_timeout max_lines; do
+	if [[ ! "${!one_setting}" =~ ^[0-9]+$ ]]; then
+		echo "${one_setting} must be a number, got '${!one_setting}'" >&2
+		exit 1
+	fi
+done
+if ((git_every_hours == 0)); then
+	echo "git_every_hours must be at least 1" >&2
+	exit 1
+fi
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_RUN_ID:-0}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
